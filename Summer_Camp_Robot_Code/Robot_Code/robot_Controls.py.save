@@ -1,0 +1,254 @@
+#!/usr/bin/env python
+
+# 2017-2-15
+# Senior Design Summer Camp Robot Control Python
+
+import urllib2
+import re
+import time
+import sys
+import commands
+import socket
+import fcntl, os
+import errno
+import pigpio
+import read_PWM
+import PID
+import RPi.GPIO as GPIO  
+
+#define PCB pins
+LeftMotorPin    = 18 # pwm broadcom pin 18 (switch pin with Servo)
+RightMotorPin   = 23 # pwm broadcom pin 23
+ServoPin        = 24 # pwm broadcom pin 24 (servo - note: need to use 50hz - range is 1 to 10)
+RCJoyXPin       = 21 # RC Channel 1 (left/right)
+RCJoyYPin       = 20 # RC channel 2 (forward/back)
+ServoControlPin = 16 # RC channel 3 (forward/back)
+KillSwitchPin   = 26 # RC channel 5 (robot kill switch)
+RCSwitchPin     = 19 # RC channel 6 (RC/Autonomous switch)
+
+#define PWM frequency
+freq = 50
+
+#server interaction
+bot_number = 1#int(commands.getoutput("ifconfig").split("\n")[18].split()[1][16:])
+server_ip = '192.168.1.10'
+
+#moon delay variables
+delay_time = []
+motor_right = []
+motor_left = []
+motor_servo = []
+rc_delay = 0
+purge_delay = 0
+
+#motor variables
+motorCenter = 7.3
+motorDeadzone = 0.2
+controllerOffset = -0.95
+controllerCenter = 8.15
+rc_sens = 1
+
+#UDP
+laptop_ip = '192.168.1.105'
+pi_ip = '192.168.1.11'#commands.getoutput("ifconfig").split("\n")[19].split()[1][5:] #look in ifconfig for pi IP
+rec_port = 54321
+send_port = 54322
+
+#set up UDP
+UDPreciever = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+UDPreciever.bind((pi_ip, rec_port))
+fcntl.fcntl(UDPreciever, fcntl.F_SETFL, os.O_NONBLOCK)
+
+#Start PID
+servo_PID = PID.PID(0.5,0,0)
+servo_PID.setPoint = 0.0
+last_in = 0
+feedback = 0
+output = 0
+
+#pin set up
+GPIO.setmode(GPIO.BCM) # Broadcom pin-numbering scheme
+
+#pin set output
+GPIO.setup(LeftMotorPin, GPIO.OUT)
+GPIO.setup(RightMotorPin, GPIO.OUT)
+GPIO.setup(ServoPin, GPIO.OUT)
+GPIO.setup(RCSwitchPin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(RCJoyXPin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(RCJoyYPin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(ServoControlPin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+#pin set freq
+LeftMotor = GPIO.PWM(LeftMotorPin,freq)
+RightMotor = GPIO.PWM(RightMotorPin,freq)
+Servo = GPIO.PWM(ServoPin,freq)
+
+#pin start
+LeftMotor.start(100)
+RightMotor.start(100)
+Servo.start(0)
+
+#reciever pigpio
+RCJoyXPigpio        = pigpio.pi() # RC Channel 1 (left/right)
+RCJoyYPigpio        = pigpio.pi() # RC channel 2 (forward/back)
+ServoControlPigpio  = pigpio.pi() # RC channel 3 (forward/back)
+KillSwitchPigpio    = pigpio.pi() # RC channel 5 (robot kill switch)
+RCSwitchPigpio      = pigpio.pi() # RC channel 6 (RC/Autonomous switch)
+
+#start pigpio reader
+RCJoyXReader        = read_PWM.reader(RCJoyXPigpio, RCJoyXPin) # RC Channel 1 (left/right)
+RCJoyYReader        = read_PWM.reader(RCJoyYPigpio, RCJoyYPin) # RC channel 2 (forward/back)
+ServoControlReader  = read_PWM.reader(ServoControlPigpio, ServoControlPin) # RC channel 3 (forward/back)
+KillSwitchReader    = read_PWM.reader(KillSwitchPigpio, KillSwitchPin) # RC channel 5 (robot kill switch)
+RCSwitchReader      = read_PWM.reader(RCSwitchPigpio, RCSwitchPin) # RC channel 6 (RC/Autonomous switch)
+
+time.sleep(1.0)
+
+try:
+  while True:
+    #print("RCSwitchReader={:.2f}".format(RCSwitchReader.duty_cycle()))
+    # check if killed
+    while KillSwitchReader.duty_cycle() < controllerCenter:
+        #do nothing, its dead
+        #print("DEAD")
+        LeftMotor.ChangeDutyCycle(100)
+        RightMotor.ChangeDutyCycle(100)
+        rc_info_http = urllib2.urlopen("http://"+server_ip+"/rc_info.php").read()
+        rc_info = re.findall(r"[-+]?\d*\.\d+|\d+",rc_info_http)
+        rc_delay = float(bot_number+(bot_number-1)*3])
+        rc_sens = float(bot_number+1+(bot_number-1)*3])
+        purge_delay = 1
+        print rc_delay
+        
+    # while loop to constantly check if RC or autonomous
+    if RCSwitchReader.duty_cycle() > controllerCenter:
+        #do autonomous stuff
+        #print "AUTO"
+        try:
+          #UDPreciever.sendto("1",(laptop_ip,send_port))
+          rdata, addr = UDPreciever.recvfrom(2048)
+        except socket.error, e:
+          err = e.args[0]
+          if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
+            print 'No data available'
+            continue
+          else:
+            print e
+        else:
+          data = rdata.split(",")
+          LeftMotor.ChangeDutyCycle((float(data[0])*5)+5)
+          RightMotor.ChangeDutyCycle((float(data[1])*5)+5)
+          print("left={:.2f} right={:.2f}".format((float(data[0])*5)+5, (float(data[1])*5)+5))
+    else:
+        # get RC values
+        ServoIn = (ServoControlReader.duty_cycle()-5.4)* 2.2
+        #print ServoIn
+        
+        JoyXIn = RCJoyXReader.duty_cycle() + controllerOffset 
+        JoyYIn = RCJoyYReader.duty_cycle() + controllerOffset
+        
+        #convert joystick inputs to motor values
+        #Calculate drive turn output  due to joystick X input
+        if JoyYIn >= (motorCenter + motorDeadzone):
+            #forward
+            #print("forward")
+            PremixMotorLeft = JoyXIn
+            PremixMotorRight = motorCenter-(JoyXIn-motorCenter)
+            
+        elif JoyYIn <= (motorCenter - motorDeadzone):
+            #backward
+            #print("backward")
+            PremixMotorLeft = JoyXIn
+            PremixMotorRight = motorCenter-(JoyXIn-motorCenter)
+
+        else:
+            #stationary
+            #print("stationary")
+            PremixMotorLeft = JoyXIn
+            PremixMotorRight = motorCenter-(JoyXIn-motorCenter)
+
+        #Scale drive output due to joystick Y input (throttle)
+        PremixMotorLeft = PremixMotorLeft*(JoyYIn/motorCenter)
+        PremixMotorRight = PremixMotorRight*(JoyYIn/motorCenter)
+
+        MixMotorLeft = PremixMotorLeft*rc_sens+motorCenter*(1-rc_sens)
+        MixMotorRight = PremixMotorRight*rc_sens+motorCenter*(1-rc_sens)
+
+        #Limit inputs
+        if MixMotorLeft > 11:
+           MixMotorLeft = 11
+        elif MixMotorLeft < 3:
+           MixMotorLeft = 3
+
+        if MixMotorRight > 11:
+           MixMotorRight = 11
+        elif MixMotorRight < 3:
+           MixMotorRight = 3
+
+        if ServoIn < 0:
+          ServoIn = 0
+        elif ServoIn > 12:
+          ServoIn = 12
+        
+           
+        #Stop jitter
+        if JoyXIn <= 7.4 and JoyXIn >= 7.1 and JoyYIn <= 7.4 and JoyYIn >= 7.1:
+           MixMotorLeft = 7.3
+           MixMotorRight = 7.2
+           
+        #print("X={:.2f} Y={:.2f}".format(RCJoyXReader.duty_cycle(), RCJoyYReader.duty_cycle()))   
+        print("left={:.2f} right={:.2f}".format(MixMotorLeft, MixMotorRight))
+
+        if purge_delay == 1:
+          delay_time[:] = []
+          motor_right[:] = []
+          motor_left[:] = []
+          motor_right[:] = []
+          motor_servo[:] = []
+          purge = 0
+
+        currentTime = time.time()
+
+        delay_time.append(currentTime)
+        motor_right.append(MixMotorRight)
+        motor_left.append(MixMotorLeft)
+        motor_servo.append(ServoIn)
+        
+        if currentTime - delay_time[0] >= rc_delay:#else: # time - delay_time[0] >= rc_delay:
+          #output values to motors
+          #print len(delay_time)
+          LeftMotor.ChangeDutyCycle(motor_left[0])
+          RightMotor.ChangeDutyCycle(motor_right[0])
+          Servo.ChangeDutyCycle(motor_servo[0])
+          #print motor_servo[0]
+          delay_time.pop(0)
+          motor_left.pop(0)
+          motor_right.pop(0)
+          motor_servo.pop(0)
+          
+        time.sleep(.1)
+  
+except KeyboardInterrupt:
+  print 'Interrupted!'
+
+  print 'Canceling PWM readers'
+  RCJoyXReader.cancel()
+  RCJoyYReader.cancel()
+  ServoControlReader.cancel()
+  KillSwitchReader.cancel()
+  RCSwitchReader.cancel()
+
+  print 'Stopping Pigpio'
+  RCJoyXPigpio.stop()
+  RCJoyYPigpio.stop()
+  ServoControlPigpio.stop()
+  KillSwitchPigpio.stop()
+  RCSwitchPigpio.stop()   
+
+  print 'Cleaning GPIO'
+  GPIO.cleanup()
+
+  print 'Close UDP'
+  UDPreciever.close()
+
+  sys.exit()
